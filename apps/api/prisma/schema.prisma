@@ -1,0 +1,66 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Project {
+  id          String           @id @default(uuid())
+  name        String           @unique
+  apiKey      String           @unique @default(uuid())
+  aiEnabled   Boolean          @default(true)
+  aiProvider  String           @default("gemini") // "gemini" | "openai"
+  createdAt   DateTime         @default(now())
+  keys        TranslationKey[]
+}
+
+model Language {
+  code         String        @id // e.g., "en", "de", "fr"
+  name         String
+  enabled      Boolean       @default(true)
+  translations Translation[]
+}
+
+model TranslationKey {
+  id           String        @id @default(uuid())
+  projectId    String
+  project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  key          String
+  namespace    String        @default("common")
+  defaultValue String
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  translations Translation[]
+
+  @@unique([projectId, key, namespace])
+}
+
+enum TranslationStatus {
+  TRANSLATED
+  MISSING
+  OUTDATED
+  AI_TRANSLATED
+}
+
+model Translation {
+  id               String            @id @default(uuid())
+  translationKeyId String
+  translationKey   TranslationKey    @relation(fields: [translationKeyId], references: [id], onDelete: Cascade)
+  languageCode     String
+  language         Language          @relation(fields: [languageCode], references: [code], onDelete: Cascade)
+  translatedValue  String
+  status           TranslationStatus @default(MISSING)
+  updatedAt        DateTime          @updatedAt
+
+  @@unique([translationKeyId, languageCode])
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+}
