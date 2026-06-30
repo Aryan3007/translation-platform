@@ -6,6 +6,12 @@ web_modules/
 # Build outputs
 dist/
 build/
+
+# ...except the published SDK dist: committed so `github:` installs work even
+# when the consumer skips lifecycle scripts (prepare). The SDK's `prepare`
+# script still rebuilds it on install when scripts are enabled.
+!packages/sdk-react/dist/
+!packages/sdk-react/dist/**
 .next/
 out/
 .docusaurus/

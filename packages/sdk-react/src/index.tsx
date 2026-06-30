@@ -1,22 +1,30 @@
-import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import {
+  cacheKey,
+  dedupe,
+  getMemory,
+  readLocalStorage,
+  readStoredLanguage,
+  setMemory,
+  writeLocalStorage,
+  writeStoredLanguage,
+} from './cache';
+import { fetchBundle } from './client';
+import { interpolate } from './interpolate';
+import { KeyRegistrar } from './registrar';
+import type { Bundle, TranslationConfig, TranslationContextValue, TranslationVars } from './types';
 
-export interface TranslationConfig {
-  apiUrl: string;
-  apiKey: string;
-  projectName: string;
-  defaultLanguage?: string;
-  fallbackLanguage?: string;
-  cacheToLocalStorage?: boolean;
-}
+export type { TranslationConfig, TranslationContextValue, TranslationVars } from './types';
 
-interface TranslationContextType {
-  t: (key: string, defaultValue: string) => string;
-  language: string;
-  changeLanguage: (code: string) => Promise<void>;
-  isLoading: boolean;
-}
-
-const TranslationContext = createContext<TranslationContextType | undefined>(undefined);
+const TranslationContext = createContext<TranslationContextValue | undefined>(undefined);
 
 export const TranslationProvider: React.FC<{
   config: TranslationConfig;
@@ -29,133 +37,148 @@ export const TranslationProvider: React.FC<{
     defaultLanguage = 'en',
     fallbackLanguage = 'en',
     cacheToLocalStorage = true,
+    requestTimeoutMs = 8000,
+    maxRetries = 2,
+    registerBatchMs = 400,
+    autoRegisterMissingKeys = true,
+    onError,
   } = config;
 
-  const [language, setLanguageState] = useState<string>(() => {
-    if (typeof window !== 'undefined' && cacheToLocalStorage) {
-      return localStorage.getItem(`translation_lang:${projectName}`) || defaultLanguage;
-    }
-    return defaultLanguage;
-  });
-
-  const [translations, setTranslations] = useState<Record<string, string>>({});
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-
-  // Keep track of keys reported in the current session to avoid duplicate API calls
-  const reportedKeysRef = useRef<Set<string>>(new Set());
-
-  // Cache key helper
-  const getCacheKey = useCallback((lang: string) => `translations:${projectName.toLowerCase()}:${lang.toLowerCase()}`, [projectName]);
-
-  // Load translations
-  const loadTranslations = useCallback(async (lang: string) => {
-    setIsLoading(true);
-    const cacheKey = getCacheKey(lang);
-
-    // 1. Try local storage first (Stale-While-Revalidate)
-    if (typeof window !== 'undefined' && cacheToLocalStorage) {
-      const cached = localStorage.getItem(cacheKey);
-      if (cached) {
-        try {
-          setTranslations(JSON.parse(cached));
-          setIsLoading(false); // Render cached version immediately
-        } catch (e) {
-          console.error('Failed to parse cached translations', e);
-        }
-      }
-    }
-
-    // 2. Fetch fresh translations from API
-    try {
-      const response = await fetch(
-        `${apiUrl}/v1/translations/${projectName}/${lang}`,
-        {
-          headers: {
-            'x-api-key': apiKey,
-          },
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error(`Failed to fetch translations: ${response.statusText}`);
-      }
-
-      const data = await response.json();
-      setTranslations(data);
-
-      // Save to local storage
-      if (typeof window !== 'undefined' && cacheToLocalStorage) {
-        localStorage.setItem(cacheKey, JSON.stringify(data));
-      }
-    } catch (error) {
-      console.error('Error loading translations from Translation Platform:', error);
-    } finally {
-      setIsLoading(false);
-    }
-  }, [apiUrl, apiKey, projectName, cacheToLocalStorage, getCacheKey]);
-
-  // Load translations on mount or when language changes
-  useEffect(() => {
-    loadTranslations(language);
-  }, [language, loadTranslations]);
-
-  // Change language function
-  const changeLanguage = async (code: string) => {
-    setLanguageState(code);
-    if (typeof window !== 'undefined' && cacheToLocalStorage) {
-      localStorage.setItem(`translation_lang:${projectName}`, code);
-    }
-  };
-
-  // The translation function
-  const t = useCallback((key: string, defaultValue: string): string => {
-    const value = translations[key];
-
-    if (value !== undefined) {
-      return value;
-    }
-
-    // Key is missing! Return default value and register it in the background
-    if (typeof window !== 'undefined' && !reportedKeysRef.current.has(key)) {
-      reportedKeysRef.current.add(key);
-
-      // Non-blocking background registration
-      fetch(`${apiUrl}/v1/keys`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-        },
-        body: JSON.stringify({
-          key,
-          defaultValue,
-          namespace: 'common',
-        }),
-      })
-        .then((res) => {
-          if (!res.ok) {
-            console.warn(`Failed to auto-register missing translation key "${key}"`);
-          }
-        })
-        .catch((err) => {
-          console.error(`Error auto-registering missing translation key "${key}":`, err);
-        });
-    }
-
-    return defaultValue;
-  }, [translations, apiUrl, apiKey]);
-
-  return (
-    <TranslationContext.Provider value={{ t, language, changeLanguage, isLoading }}>
-      {children}
-    </TranslationContext.Provider>
+  const fetchConfig = useMemo(
+    () => ({ apiUrl, apiKey, projectName, requestTimeoutMs, maxRetries }),
+    [apiUrl, apiKey, projectName, requestTimeoutMs, maxRetries],
   );
+
+  // SSR-safe: never read localStorage during render. Start from default, then
+  // reconcile the stored language in a post-mount effect to avoid hydration drift.
+  const [language, setLanguageState] = useState<string>(defaultLanguage);
+  const [activeBundle, setActiveBundle] = useState<Bundle>(() => {
+    const key = cacheKey(projectName, defaultLanguage);
+    return getMemory(key) ?? {};
+  });
+  const [fallbackBundle, setFallbackBundle] = useState<Bundle>(() => {
+    const key = cacheKey(projectName, fallbackLanguage);
+    return getMemory(key) ?? {};
+  });
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isReady, setIsReady] = useState<boolean>(false);
+
+  const registrar = useMemo(
+    () => new KeyRegistrar({ apiUrl, apiKey, registerBatchMs, requestTimeoutMs, onError }),
+    [apiUrl, apiKey, registerBatchMs, requestTimeoutMs, onError],
+  );
+  useEffect(() => () => registrar.dispose(), [registrar]);
+
+  // Tracks the latest requested language so a slow in-flight response for a
+  // previous language can't overwrite a newer one.
+  const requestedLangRef = useRef(language);
+
+  const load = useCallback(
+    async (lang: string, isFallback: boolean, signal: AbortSignal) => {
+      const key = cacheKey(projectName, lang);
+      // Apply to state only if this load is still relevant: not aborted, and for
+      // the active language, still the language the user wants. Caching happens
+      // regardless so a later switch back is instant.
+      const apply = (bundle: Bundle) => {
+        if (signal.aborted) return;
+        if (isFallback) setFallbackBundle(bundle);
+        else if (requestedLangRef.current === lang) setActiveBundle(bundle);
+      };
+
+      // 1) Hot memory / localStorage first (stale-while-revalidate).
+      const cached = getMemory(key) ?? (cacheToLocalStorage ? readLocalStorage(key) : undefined);
+      if (cached) {
+        setMemory(key, cached);
+        apply(cached);
+        setIsReady(true);
+      }
+
+      // 2) Revalidate from network (deduped across providers).
+      try {
+        const fresh = await dedupe(key, () => fetchBundle(fetchConfig, lang, signal));
+        setMemory(key, fresh);
+        if (cacheToLocalStorage) writeLocalStorage(key, fresh);
+        apply(fresh);
+        setIsReady(true);
+      } catch (err) {
+        if (!(err instanceof Error && err.name === 'AbortError')) {
+          onError?.(err instanceof Error ? err : new Error(String(err)), `loadBundle:${lang}`);
+        }
+        // If we had nothing cached, we're still "ready" with defaults so the UI renders.
+        if (!cached) setIsReady(true);
+      }
+    },
+    [projectName, cacheToLocalStorage, fetchConfig, onError],
+  );
+
+  // Reconcile stored language once on mount (client only).
+  useEffect(() => {
+    if (!cacheToLocalStorage) return;
+    const stored = readStoredLanguage(projectName);
+    if (stored && stored !== language) {
+      requestedLangRef.current = stored;
+      setLanguageState(stored);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Load active language bundle whenever it changes; abort prior in-flight load.
+  useEffect(() => {
+    const controller = new AbortController();
+    setIsLoading(true);
+    load(language, false, controller.signal).finally(() => {
+      if (!controller.signal.aborted) setIsLoading(false);
+    });
+    return () => controller.abort();
+  }, [language, load]);
+
+  // Keep the fallback bundle warm when it differs from the active language.
+  useEffect(() => {
+    if (fallbackLanguage === language) return;
+    const controller = new AbortController();
+    load(fallbackLanguage, true, controller.signal);
+    return () => controller.abort();
+  }, [fallbackLanguage, language, load]);
+
+  const changeLanguage = useCallback(
+    async (code: string) => {
+      if (code === requestedLangRef.current) return;
+      requestedLangRef.current = code;
+      if (cacheToLocalStorage) writeStoredLanguage(projectName, code);
+      setLanguageState(code);
+    },
+    [projectName, cacheToLocalStorage],
+  );
+
+  const t = useCallback(
+    (key: string, defaultValue: string, vars?: TranslationVars): string => {
+      const value =
+        activeBundle[key] ??
+        (language !== fallbackLanguage ? fallbackBundle[key] : undefined);
+
+      if (value !== undefined) return interpolate(value, vars);
+
+      // Missing — queue for batched registration (client only) and render the default.
+      if (typeof window !== 'undefined' && autoRegisterMissingKeys) {
+        registrar.enqueue(key, defaultValue);
+      }
+      return interpolate(defaultValue, vars);
+    },
+    [activeBundle, fallbackBundle, language, fallbackLanguage, autoRegisterMissingKeys, registrar],
+  );
+
+  const value = useMemo<TranslationContextValue>(
+    () => ({ t, language, changeLanguage, isLoading, isReady }),
+    [t, language, changeLanguage, isLoading, isReady],
+  );
+
+  return <TranslationContext.Provider value={value}>{children}</TranslationContext.Provider>;
 };
 
-export const useTranslation = () => {
+export function useTranslation(): TranslationContextValue {
   const context = useContext(TranslationContext);
   if (context === undefined) {
     throw new Error('useTranslation must be used within a TranslationProvider');
   }
   return context;
-};
+}
