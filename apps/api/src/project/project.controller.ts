@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Put, Param, Body, UseGuards } from '@nestjs/common';
 import { ProjectService } from './project.service';
 import { JwtGuard } from '../auth/jwt.guard';
 import { CreateProjectDto } from '@translation-platform/shared';

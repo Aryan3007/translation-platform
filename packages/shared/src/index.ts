@@ -75,6 +75,6 @@ export type TranslationsGridItem = {
   translations: Record<string, {
     id: string;
     translatedValue: string;
-    status: 'TRANSLATED' | 'MISSING' | 'OUTDATED';
+    status: 'TRANSLATED' | 'MISSING' | 'OUTDATED' | 'AI_TRANSLATED';
   }>;
 };

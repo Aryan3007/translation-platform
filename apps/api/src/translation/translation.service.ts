@@ -143,7 +143,7 @@ export class TranslationService {
     const languages = await this.prisma.language.findMany({
       where: {
         enabled: true,
-        code: { not: { equals: 'en', mode: 'insensitive' } },
+        code: { not: 'en' },
       },
     });
 
