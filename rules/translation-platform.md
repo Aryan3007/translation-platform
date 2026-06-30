@@ -9,7 +9,7 @@ All translations in this project are managed via our centralized **Translation P
 ### Install the SDK
 Install the React SDK directly from the Translation Platform repository:
 ```bash
-pnpm add github:your-username/translation-platform#sdk-react
+pnpm add github:Aryan3007/translation-platform#path:packages/sdk-react
 ```
 
 ### Environment Variables
